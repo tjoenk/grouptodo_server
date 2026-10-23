@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+"""
+GroupToDo sync server.
+
+grouptodo.html is standalone, but browsers outside desktop Chrome/Edge cannot
+write to a folder on their own. This serves it and exposes a tiny REST API over
+a markdown vault so the app reads and writes the very same .md files that Neovim,
+Logseq or Obsidian open.
+
+    python3 serve.py [--vault DIR] [--port 8777] [--host 127.0.0.1]
+                     [--password-file FILE] [--insecure]
+                     [--open-in-editor [--open-with CMD]]
+    python3 serve.py --calendars-only      (only fetches calendar links)
+
+Defaults to the vault path used by the original Neovim config:
+    ~/storage/shared/Documents/OrgMode
+
+API
+    GET    /api/ping            -> {"ok": true, ...}
+    GET    /api/asset?path=assets/x.png  -> the bytes of a dropped file
+    PUT    /api/asset?path=assets/x.png  -> write one (body is the bytes)
+    GET    /api/list            -> ["journals/2026-09-17.md", "pages/1/Foo.md", ...]
+    GET    /api/file?path=REL   -> raw file contents
+    PUT    /api/file?path=REL   -> writes the body (creates parent dirs)
+    DELETE /api/file?path=REL   -> deletes the file
+    POST   /api/open?path=REL   -> opens that file in an editor ON THIS MACHINE,
+                                   and only with --open-in-editor; 403 otherwise
+    GET    /api/calendar?url=U  -> the iCalendar file at U, fetched by the server
+
+The app's CSP only lets it talk to itself and to localhost, so a calendar
+link (Outlook, Google, iCloud) is fetched here on its behalf. Only https
+links to public addresses are fetched, and only a reply that is an
+iCalendar file is passed back, so this is not a general way out to the
+network for any page that can reach the port.
+
+--calendars-only runs just that: no vault, no files, only /api/ping and
+/api/calendar. It is for an app opened from a folder, which keeps its files
+itself and only needs something on this computer to fetch calendar links.
+
+Every path is confined to the vault; traversal outside it is refused.
+
+--open-in-editor lets the app ask for a page to be opened in an editor -- the
+"open file" button beside "copy path". The editor runs here, on the machine with
+the vault on it, so it is off by default and the flag is the whole consent: with
+a password and a tunnel in front, anybody holding that password can make this
+process launch an editor on your desktop. Harmless as such things go (it is one
+of your own .md files, in a text editor) but it is yours to choose. --open-with
+names the command when the system default is not what you want.
+
+Binds to localhost by default and serves openly there. Reaching it from
+anywhere else needs a password, set through GTD_PASSWORD or --password-file:
+binding a non-loopback address without one is refused outright rather than
+warned about. The password is checked with HTTP Basic, so the browser prompts
+for it once and then attaches it to everything -- the page, the service worker
+and the API alike.
+
+Basic encodes rather than encrypts, so it is only private over HTTPS. The
+intended shape is this server on localhost with TLS terminated in front of it:
+
+    python3 serve.py --vault ~/vaults/work        # localhost, open
+    tailscale serve --bg 8777                     # HTTPS, your devices only
+
+    GTD_PASSWORD=... python3 serve.py --vault ~/vaults/work
+    tailscale funnel --bg 8777                    # HTTPS, anyone with the URL
+                                                  # -- hence the password
+"""
+
+import argparse
+import base64
+import hmac
+import ipaddress
+import json
+import os
+import posixpath
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_VAULT = os.path.expanduser("~/storage/shared/Documents/OrgMode")
+ALLOWED_EXT = (".md", ".org")
+# Files dragged onto a line: pictures and documents, kept beside the markdown
+# that mentions them, in one folder of their own so a vault walk never meets
+# them. Anything outside it stays off limits whatever its name.
+ASSET_DIR = "assets"
+SKIP_DIRS = {".git", ".obsidian", ".trash", "node_modules", "logseq"}
+MAX_BODY = 8 * 1024 * 1024
+MAX_CALENDAR = 8 * 1024 * 1024
+
+
+def check_calendar_url(url):
+    """Refuse anything but https to a public address."""
+    u = urlparse(url)
+    if u.scheme != "https" or not u.hostname:
+        raise ValueError("only https:// (or webcal://) calendar links are fetched")
+    try:
+        infos = socket.getaddrinfo(u.hostname, u.port or 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        raise ValueError("cannot find %s" % u.hostname)
+    for info in infos:
+        if not ipaddress.ip_address(info[4][0].split("%")[0]).is_global:
+            raise ValueError("%s is not on the public internet" % u.hostname)
+
+
+class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        check_calendar_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_calendar(url):
+    url = re.sub(r"^webcal://", "https://", (url or "").strip(), flags=re.I)
+    check_calendar_url(url)
+    opener = urllib.request.build_opener(_CheckedRedirect)
+    req = urllib.request.Request(url, headers={"User-Agent": "GroupToDo calendar import",
+                                               "Accept": "text/calendar, */*;q=0.5"})
+    with opener.open(req, timeout=20) as r:
+        body = r.read(MAX_CALENDAR + 1)
+    if len(body) > MAX_CALENDAR:
+        raise ValueError("that calendar is too large")
+    text = body.decode("utf-8", "replace")
+    if "BEGIN:VCALENDAR" not in text[:4096]:
+        raise ValueError("that link did not return a calendar")
+    return text
+
+
+class Vault:
+    def __init__(self, root):
+        self.root = os.path.abspath(os.path.expanduser(root))
+        os.makedirs(self.root, exist_ok=True)
+
+    def resolve(self, rel):
+        """Map a client-supplied relative path to an absolute path inside the vault."""
+        if not rel:
+            raise ValueError("empty path")
+        rel = posixpath.normpath(rel.replace("\\", "/")).lstrip("/")
+        if rel.startswith("..") or os.path.isabs(rel):
+            raise ValueError("path escapes the vault")
+        if not rel.endswith(ALLOWED_EXT):
+            raise ValueError("only .md and .org files are served")
+        full = os.path.abspath(os.path.join(self.root, rel))
+        if full != self.root and not full.startswith(self.root + os.sep):
+            raise ValueError("path escapes the vault")
+        return full
+
+    def resolve_asset(self, rel):
+        """Map a client path to a file inside the vault's assets/ folder."""
+        if not rel:
+            raise ValueError("empty path")
+        rel = posixpath.normpath(rel.replace("\\", "/")).lstrip("/")
+        if rel.startswith("..") or os.path.isabs(rel):
+            raise ValueError("path escapes the vault")
+        parts = rel.split("/")
+        if parts[0] != ASSET_DIR or len(parts) < 2 or any(p in ("", ".", "..") for p in parts):
+            raise ValueError("only files under %s/ are served" % ASSET_DIR)
+        if parts[-1].endswith(ALLOWED_EXT):
+            raise ValueError("pages are served from /api/file")
+        full = os.path.abspath(os.path.join(self.root, rel))
+        if not full.startswith(os.path.join(self.root, ASSET_DIR) + os.sep):
+            raise ValueError("path escapes the vault")
+        return full
+
+    def read_asset(self, rel):
+        with open(self.resolve_asset(rel), "rb") as fh:
+            return fh.read()
+
+    def write_asset(self, rel, data):
+        full = self.resolve_asset(rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        tmp = full + ".tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, full)
+
+    def list(self):
+        out = []
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+            for name in filenames:
+                if not name.endswith(ALLOWED_EXT) or name.startswith("."):
+                    continue
+                full = os.path.join(dirpath, name)
+                out.append(os.path.relpath(full, self.root).replace(os.sep, "/"))
+        return sorted(out)
+
+    def read(self, rel):
+        with open(self.resolve(rel), "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def write(self, rel, text):
+        full = self.resolve(rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        tmp = full + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, full)          # atomic: never leaves a half-written page
+
+    def delete(self, rel):
+        full = self.resolve(rel)
+        if os.path.exists(full):
+            os.remove(full)
+
+
+def open_in_editor(full, command=None):
+    """Open one file in an editor on THIS machine. Returns what was used.
+
+    A browser cannot launch a program, which is right, so the only process in a
+    position to do this is the one already holding the vault. An explicit
+    command wins; otherwise the system's own idea of who owns a .md file, which
+    on Windows is Notepad on a stock install, and the Notepad fallback is there
+    for the machine where nothing is registered for the extension at all."""
+    if command:
+        argv = shlex.split(command) + [full]
+        subprocess.Popen(argv)
+        return os.path.basename(argv[0])
+    if sys.platform.startswith("win"):
+        try:
+            os.startfile(full)             # noqa: S606 - the default handler
+            return "the default editor"
+        except OSError:
+            subprocess.Popen(["notepad.exe", full])
+            return "Notepad"
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", "-t", full])
+        return "the default editor"
+    subprocess.Popen(["xdg-open", full])
+    return "the default editor"
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "GroupToDo/1.0"
+    vault = None
+    password = None        # None = open; anything else = HTTP Basic required
+    realm = "GroupToDo"
+    allow_open = False     # --open-in-editor: may launch an editor on this box
+    open_with = None       # --open-with: the command to launch, if not the default
+
+    # ---------- helpers ----------
+    def _send(self, code, body=b"", ctype="text/plain; charset=utf-8"):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        if not self.password:
+            # Only an unprotected local server invites other origins in. Once a
+            # password is set the app is served from this origin anyway, and a
+            # wildcard would only widen what a hostile page could attempt.
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj), "application/json; charset=utf-8")
+
+    def _rel(self):
+        q = parse_qs(urlparse(self.path).query)
+        vals = q.get("path") or []
+        return vals[0] if vals else ""
+
+    # ---------- the gate ----------
+    # HTTP Basic rather than a token the app would have to carry: the browser
+    # prompts natively, remembers it per origin, and attaches it to EVERY
+    # request -- the page, sw.js and the API alike. A token in a header would
+    # protect the API and leave the page itself open, and would need a login
+    # screen inside the app that the service worker then had to reason about.
+    #
+    # Basic sends the password reversibly encoded, so it is only private over
+    # HTTPS. Terminate TLS in front of this (tailscale serve / funnel, or a
+    # reverse proxy) and leave this bound to localhost.
+    def authorised(self):
+        if not self.password:
+            return True
+        header = self.headers.get("Authorization") or ""
+        if not header.startswith("Basic "):
+            return False
+        try:
+            raw = base64.b64decode(header[6:].strip(), validate=True).decode("utf-8")
+        except Exception:
+            return False
+        _, _, supplied = raw.partition(":")
+        # compare_digest so a wrong guess takes the same time as a near miss
+        return hmac.compare_digest(supplied, self.password)
+
+    def demand_password(self):
+        time.sleep(0.5)                 # make a guessing run expensive
+        body = b"GroupToDo: password required.\n"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="%s", charset="UTF-8"' % self.realm)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        if self.path.startswith("/api/file") and self.command == "GET":
+            return                      # loading a vault is hundreds of reads; stay quiet
+        super().log_message(fmt, *args)
+
+    # ---------- verbs ----------
+    def do_OPTIONS(self):
+        self._send(204)
+
+    def do_GET(self):
+        if not self.authorised():
+            return self.demand_password()
+        route = urlparse(self.path).path
+        if route == "/api/ping":
+            if self.vault is None:
+                return self._json(200, {"ok": True, "calendarsOnly": True})
+            return self._json(200, {"ok": True, "vault": self.vault.root,
+                                    "files": len(self.vault.list()),
+                                    "open_in_editor": bool(self.allow_open)})
+        if self.vault is None and route.startswith("/api/") and route != "/api/calendar":
+            return self._send(404, "this helper only fetches calendars")
+        if route == "/api/list":
+            return self._json(200, self.vault.list())
+        if route == "/api/calendar":
+            url = (parse_qs(urlparse(self.path).query).get("url") or [""])[0]
+            try:
+                return self._send(200, fetch_calendar(url), "text/calendar; charset=utf-8")
+            except ValueError as exc:
+                return self._send(400, str(exc))
+            except Exception as exc:
+                return self._send(502, "could not fetch the calendar: %s" % exc)
+        if route == "/api/file":
+            try:
+                return self._send(200, self.vault.read(self._rel()), "text/markdown; charset=utf-8")
+            except (ValueError, KeyError) as exc:
+                return self._send(400, str(exc))
+            except FileNotFoundError:
+                return self._send(404, "not found")
+        if route == "/api/asset":
+            rel = self._rel()
+            try:
+                body = self.vault.read_asset(rel)
+            except (ValueError, KeyError) as exc:
+                return self._send(400, str(exc))
+            except (FileNotFoundError, IsADirectoryError):
+                return self._send(404, "not found")
+            ext = os.path.splitext(rel)[1].lower()
+            return self._send(200, body, self.CTYPES.get(ext, "application/octet-stream"))
+        return self._static(route)
+
+    # The static and API handlers already suppress bodies for HEAD.
+    do_HEAD = do_GET
+
+    def do_POST(self):
+        if not self.authorised():
+            return self.demand_password()
+        if self.vault is None or urlparse(self.path).path != "/api/open":
+            return self._send(404, "not found")
+        if not self.allow_open:
+            return self._send(403, "This server was not started with --open-in-editor, "
+                                   "so it will not launch anything.")
+        # A plain cross-origin POST needs no preflight, so any page in the
+        # browser could otherwise poke an open server into launching an editor.
+        # Demanding a header that is not on the Allow-Headers list forces a
+        # preflight the browser then refuses -- the app's own fetch, same
+        # origin, is unaffected.
+        if (self.headers.get("X-GroupTodo") or "") != "open":
+            return self._send(403, "This endpoint is for the app itself.")
+        try:
+            full = self.vault.resolve(self._rel())
+        except ValueError as exc:
+            return self._send(400, str(exc))
+        if not os.path.isfile(full):
+            return self._send(404, "There is no such file in the vault yet.")
+        try:
+            used = open_in_editor(full, self.open_with)
+        except Exception as exc:          # no editor, no display, a bad --open-with
+            return self._send(500, "Could not open an editor here: %s" % exc)
+        return self._json(200, {"ok": True, "with": used})
+
+    def do_PUT(self):
+        if not self.authorised():
+            return self.demand_password()
+        route = urlparse(self.path).path
+        if self.vault is None or route not in ("/api/file", "/api/asset"):
+            return self._send(404, "not found")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY:
+            return self._send(413, "too large")
+        raw = self.rfile.read(length)
+        try:
+            if route == "/api/asset":
+                self.vault.write_asset(self._rel(), raw)
+            else:
+                self.vault.write(self._rel(), raw.decode("utf-8"))
+        except ValueError as exc:
+            return self._send(400, str(exc))
+        return self._json(200, {"ok": True})
+
+    def do_DELETE(self):
+        if not self.authorised():
+            return self.demand_password()
+        if self.vault is None or urlparse(self.path).path != "/api/file":
+            return self._send(404, "not found")
+        try:
+            self.vault.delete(self._rel())
+        except ValueError as exc:
+            return self._send(400, str(exc))
+        except OSError as exc:
+            # A file a sync client has open (OneDrive does this) will not go.
+            # Say so, so the app keeps the delete and tries again, instead of
+            # the old file of a moved project turning up again at the next load.
+            return self._send(500, "could not delete: " + str(exc))
+        return self._json(200, {"ok": True})
+
+    # ---------- the app itself ----------
+    # Served from the script's own folder. grouptodo.html alone is enough to run
+    # the app; sw.js, manifest.webmanifest and icon.svg are what turn it into
+    # something a phone will keep on its home screen and open with no server.
+    # When sw.js is missing -- someone copied out grouptodo.html and serve.py only
+    # -- a built-in copy is served instead, so offline still works.
+    FALLBACK_SW = """
+const SHELL = "grouptodo-shell-v3";
+self.addEventListener("install", e => {
+  e.waitUntil(caches.open(SHELL)
+    .then(c => Promise.all(["./", "./grouptodo.html"].map(f => c.add(f).catch(() => {}))))
+    .then(() => self.skipWaiting()));
+});
+self.addEventListener("activate", e => {
+  e.waitUntil(caches.keys()
+    .then(ks => Promise.all(ks.filter(k => k !== SHELL).map(k => caches.delete(k))))
+    .then(() => self.clients.claim()));
+});
+self.addEventListener("fetch", e => {
+  if (e.request.method !== "GET") return;
+  const url = new URL(e.request.url);
+  // The vault is never cached: a stale page is fine, stale tasks are not.
+  if (url.pathname.indexOf("/api/") !== -1) return;
+  if (e.request.mode !== "navigate" &&
+      url.pathname !== "/" && !/grouptodo\\.html$/.test(url.pathname)) return;
+  e.respondWith(
+    fetch(e.request)
+      .then(r => {
+        if (r && r.ok) {
+          const copy = r.clone();
+          caches.open(SHELL).then(c => c.put(e.request, copy)).catch(() => {});
+        }
+        return r;
+      })
+      .catch(() => caches.match(e.request, {ignoreSearch: true})
+        .then(m => m || caches.match("./grouptodo.html", {ignoreSearch: true})))
+  );
+});
+"""
+
+    CTYPES = {
+        ".html": "text/html; charset=utf-8",
+        ".js": "application/javascript; charset=utf-8",
+        ".webmanifest": "application/manifest+json; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".svg": "image/svg+xml",
+        ".css": "text/css; charset=utf-8",
+        ".png": "image/png",
+        ".md": "text/markdown; charset=utf-8",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".avif": "image/avif",
+        ".bmp": "image/bmp",
+        ".ico": "image/x-icon",
+        ".pdf": "application/pdf",
+        ".txt": "text/plain; charset=utf-8",
+        ".csv": "text/csv; charset=utf-8",
+        ".zip": "application/zip",
+    }
+
+    def _file(self, full, ctype, extra=()):
+        with open(full, "rb") as fh:
+            body = fh.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        for k, v in extra:
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _static(self, route):
+        # "/" is the app itself, not the redirect stub that exists for static hosts.
+        name = "grouptodo.html" if route in ("/", "") else os.path.basename(route)
+        if not re.fullmatch(r"[\w.-]+", name or ""):
+            return self._send(404, "not found")
+        full = os.path.join(SCRIPT_DIR, name)
+        ext = os.path.splitext(name)[1].lower()
+        ctype = self.CTYPES.get(ext, "application/octet-stream")
+
+        if name == "sw.js":
+            # Service-Worker-Allowed lets the worker claim the whole origin even
+            # though it is fetched from a subpath.
+            if os.path.isfile(full):
+                return self._file(full, ctype, [("Service-Worker-Allowed", "/")])
+            body = self.FALLBACK_SW.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Service-Worker-Allowed", "/")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+            return
+
+        if not os.path.isfile(full):
+            return self._send(404, "not found")
+        return self._file(full, ctype)
+
+
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def read_password(args):
+    """Prefer a file, then the environment, then the command line.
+
+    argv is the worst of the three: it shows up in `ps` for every other user on
+    the machine and in your shell history. It stays available because it is the
+    one that works in a one-line service definition, but it says so."""
+    if args.password_file:
+        with open(os.path.expanduser(args.password_file), "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    if os.environ.get("GTD_PASSWORD"):
+        return os.environ["GTD_PASSWORD"].strip()
+    if args.password:
+        print("note: --password is visible in `ps`; prefer GTD_PASSWORD or --password-file")
+        return args.password.strip()
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Serve GroupToDo over a markdown vault.")
+    ap.add_argument("--vault", default=os.environ.get("GTD_VAULT", DEFAULT_VAULT))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("GTD_PORT", 8777)))
+    ap.add_argument("--host", default=os.environ.get("GTD_HOST", "127.0.0.1"))
+    ap.add_argument("--password", help="shared password (see --password-file)")
+    ap.add_argument("--password-file", help="file whose contents are the password")
+    ap.add_argument("--insecure", action="store_true",
+                    help="allow a non-loopback bind with no password (don't)")
+    ap.add_argument("--calendars-only", action="store_true",
+                    help="no vault: only fetch calendar links for an app opened from a folder")
+    ap.add_argument("--open-in-editor", action="store_true",
+                    default=bool(os.environ.get("GTD_OPEN_IN_EDITOR")),
+                    help="let the app open a page in an editor on THIS machine")
+    ap.add_argument("--open-with", default=os.environ.get("GTD_OPEN_WITH"),
+                    help="the command --open-in-editor runs (default: the system's own)")
+    args = ap.parse_args()
+
+    password = read_password(args)
+    exposed = args.host not in LOOPBACK
+
+    # Refuse by default rather than warn. The old build printed a warning and
+    # served the vault anyway, which is the wrong way round for something
+    # holding somebody's work.
+    if exposed and not password and not args.insecure:
+        sys.exit(
+            "refusing to bind %s with no password.\n"
+            "  Anyone who can reach that address could read and rewrite the vault.\n"
+            "  Either:\n"
+            "    GTD_PASSWORD=... python3 serve.py --host %s      (set a password)\n"
+            "    python3 serve.py                                  (localhost only, then\n"
+            "      put tailscale serve / a reverse proxy in front for TLS)\n"
+            "    python3 serve.py --host %s --insecure            (a network you fully trust)"
+            % (args.host, args.host, args.host))
+
+    if password and len(password) < 10:
+        sys.exit("password too short: use at least 10 characters, it is reachable from a browser")
+
+    if args.open_with and not args.open_in_editor:
+        sys.exit("--open-with does nothing without --open-in-editor")
+
+    Handler.password = password
+    Handler.allow_open = args.open_in_editor
+    Handler.open_with = args.open_with
+    if args.calendars_only:
+        Handler.vault = None
+        print("mode  : calendars only - fetches calendar links, keeps no files")
+    else:
+        Handler.vault = Vault(args.vault)
+        count = len(Handler.vault.list())
+        print(f"vault : {Handler.vault.root}  ({count} markdown files)")
+    print(f"open  : http://{args.host}:{args.port}/")
+    print("auth  : " + ("password required" if password else "open (localhost only)"))
+    if args.open_in_editor:
+        print("editor: " + (args.open_with or "the system default") +
+              "  -- the app can open pages in it, here on this machine")
+    if exposed and password:
+        print("note  : HTTP Basic is only private over HTTPS -- terminate TLS in front of this")
+    if exposed and not password:
+        print("WARNING: --insecure, no password; anyone who can reach this port owns the vault")
+    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

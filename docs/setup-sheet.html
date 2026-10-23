@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Setting Up GroupToDo</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bitter:wght@500;700&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one narrow reading column. The two-minute path is the whole page;
+   anything that is not those four steps is pushed below a rule and marked as
+   such. Slab headings + humanist body so it reads like a workshop card. */
+:root {
+  --paper:      #f7f8f9;
+  --card:       #ffffff;
+  --ink:        #15202b;
+  --ink-soft:   #51606e;
+  --ink-faint:  #8696a4;
+  --rule:       #dde3e8;
+  --accent:     #1f6fd0;
+  --accent-soft:#e8f1fc;
+  --flag:       #9a6100;
+  --flag-soft:  #fdf2dd;
+  --display: "Bitter", Georgia, "Times New Roman", serif;
+  --body:    "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  --mono:    "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #11161b; --card: #1a2128; --ink: #e8eef3; --ink-soft: #a8b7c4;
+    --ink-faint: #76858f; --rule: #2b353f; --accent: #76b2f5; --accent-soft: #16293d;
+    --flag: #e8b253; --flag-soft: #2d2311; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #11161b; --card: #1a2128; --ink: #e8eef3; --ink-soft: #a8b7c4;
+  --ink-faint: #76858f; --rule: #2b353f; --accent: #76b2f5; --accent-soft: #16293d;
+  --flag: #e8b253; --flag-soft: #2d2311; color-scheme: dark;
+}
+
+body { background: var(--paper); color: var(--ink); font-family: var(--body); font-size: 16.5px; line-height: 1.6; }
+.wrap { max-width: 50rem; margin: 0 auto; padding-inline: 20px; padding-block: 40px 72px; }
+h1, h2, h3 { font-family: var(--display); font-weight: 700; text-wrap: balance; margin: 0; letter-spacing: -0.01em; }
+h1 { font-size: clamp(1.85rem, 1.3rem + 2.2vw, 2.55rem); line-height: 1.15; }
+h2 { font-size: 1.28rem; }
+h3 { font-size: 1.02rem; font-weight: 500; }
+p { margin: 0; max-width: 60ch; }
+code, .path { font-family: var(--mono); font-size: 0.87em; background: var(--accent-soft); color: var(--ink);
+  padding: 1px 5px; border-radius: 3px; overflow-wrap: anywhere; }
+.eyebrow { font-size: 0.74rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.12em; color: var(--ink-faint); }
+.lede { font-size: 1.1rem; color: var(--ink-soft); max-width: 56ch; }
+
+header { display: flex; flex-direction: column; gap: 12px; padding-bottom: 26px; border-bottom: 2px solid var(--ink); }
+section { padding-block: 32px; border-bottom: 1px solid var(--rule); display: flex; flex-direction: column; gap: 18px; }
+section:last-of-type { border-bottom: 0; }
+
+ol.steps { list-style: none; margin: 0; padding: 0; counter-reset: s; display: flex; flex-direction: column; gap: 18px; }
+ol.steps > li { counter-increment: s; display: grid; grid-template-columns: 2rem 1fr; gap: 14px; align-items: start; }
+ol.steps > li::before { content: counter(s); font-family: var(--mono); font-size: 0.85rem; font-weight: 500;
+  color: var(--accent-soft); background: var(--accent); border-radius: 50%;
+  width: 2rem; height: 2rem; display: grid; place-items: center; }
+ol.steps .body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+ol.steps .what { font-weight: 600; font-size: 1.02rem; }
+ol.steps .note { font-size: 0.93rem; color: var(--ink-soft); }
+
+.why { background: var(--card); border: 1px solid var(--rule); border-radius: 10px; padding: 20px 22px;
+  display: flex; flex-direction: column; gap: 12px; }
+.why p { font-size: 0.97rem; }
+.why .pull { font-family: var(--display); font-weight: 500; font-size: 1.08rem; color: var(--ink); }
+
+dl.habits { margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 20px; }
+dl.habits > div { min-width: 0; }
+dl.habits dt { font-weight: 600; margin-bottom: 3px; }
+dl.habits dd { margin: 0; font-size: 0.93rem; color: var(--ink-soft); }
+
+.flag { background: var(--flag-soft); border-left: 3px solid var(--flag); border-radius: 0 6px 6px 0;
+  padding: 14px 16px; display: flex; flex-direction: column; gap: 5px; }
+.flag .title { font-weight: 600; color: var(--flag); }
+.flag p { font-size: 0.93rem; }
+
+details { background: var(--card); border: 1px solid var(--rule); border-radius: 10px; padding: 0; }
+details + details { margin-top: 12px; }
+summary { cursor: pointer; padding: 15px 20px; font-weight: 600; list-style: none; display: flex; gap: 10px; align-items: baseline; }
+summary::-webkit-details-marker { display: none; }
+summary::before { content: "+"; font-family: var(--mono); color: var(--accent); font-weight: 500; }
+details[open] summary::before { content: "\2212"; }
+summary .sub { font-weight: 400; font-size: 0.88rem; color: var(--ink-faint); }
+.inner { padding: 0 20px 20px; display: flex; flex-direction: column; gap: 14px; }
+.inner ol.steps > li::before { background: var(--accent-soft); color: var(--accent); }
+
+footer { padding-top: 30px; color: var(--ink-faint); font-size: 0.88rem; display: flex; flex-direction: column; gap: 6px; }
+a { color: var(--accent); }
+</style>
+
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <span class="eyebrow">Two minutes, on a computer</span>
+  <h1>Setting up GroupToDo</h1>
+  <p class="lede">A shared to-do list that keeps everything as ordinary text files in a folder
+  you already have. Nothing to install, no account, no password. Two minutes and you and your
+  colleagues are working on the same list.</p>
+</header>
+
+<section>
+  <span class="eyebrow">Why this one can be shared</span>
+  <div class="why">
+    <p class="pull">Most task apps keep your tasks on their servers. That is the reason sharing
+    one is such a nuisance.</p>
+    <p>Everybody needs an account on the same thing, somebody has to pay for the seats, and
+    getting a colleague added means a request to whoever administers it. So people give up and
+    paste lists into chat instead.</p>
+    <p><strong>GroupToDo has no server, so there is nothing to be a member of.</strong> Your tasks
+    are plain text files sitting in a folder. Share the folder the way you already share folders
+    and you are done — the sharing is your company's, not ours. Nobody is invited to anything,
+    nobody pays for a seat, and when somebody leaves you remove them from the folder.</p>
+    <p>It also means the list outlives the tool. The files open in Notepad.</p>
+  </div>
+</section>
+
+<section>
+  <span class="eyebrow">Do this now</span>
+  <h2>Who, where, what</h2>
+  <ol class="steps">
+    <li><div class="body">
+      <span class="what">Who &mdash; type your first and last name</span>
+      <span class="note">It is the first thing the app asks. Colleagues see it beside what
+      you add, and the surname is what saves you the day there are two of you called the
+      same thing.</span>
+    </div></li>
+    <li><div class="body">
+      <span class="what">Where &mdash; <strong>Choose folder</strong>, and pick the shared one</span>
+      <span class="note">Say yes when the browser asks to let the page edit it. From here on
+      your tasks are files in that folder, saved as you type. Skip it and everything stays in
+      this browser until you decide.</span>
+    </div></li>
+    <li><div class="body">
+      <span class="what">What &mdash; <strong>Start a new list</strong> and type your first task</span>
+      <span class="note">The box is already waiting. Press Enter. Use Edge or Chrome.</span>
+    </div></li>
+  </ol>
+  <p>That is it. To bring somebody in, use <strong>the areas menu at the top right &rarr; Invite somebody</strong> — it
+  makes one file that arrives with the area already set up.</p>
+  <p>If colleagues already put your name on things while you were getting set up, the app
+  spots them and offers you the pile. Take them on and they become your tasks &mdash; and
+  stay in your colleagues&rsquo; <em>Waiting&nbsp;for</em>, because they wrote them.</p>
+</section>
+
+<section>
+  <span class="eyebrow">Learn it by using it</span>
+  <h2>Four things, and nothing else to read</h2>
+  <p>Nothing is hidden, but nothing shows up before it is about something. Options appear as
+  you start needing them.</p>
+  <dl class="habits">
+    <div>
+      <dt>Today is yours</dt>
+      <dd>Your day page is your own, so nobody is typing over you. What you put on it is still
+      visible to everyone.</dd>
+    </div>
+    <div>
+      <dt>A task is yours by default</dt>
+      <dd>Write it, it is yours. No assigning, no ceremony.</dd>
+    </div>
+    <div>
+      <dt>Hand it over and it tracks itself</dt>
+      <dd>Give a task to a colleague and it becomes theirs — and shows up in your
+      <em>Waiting&nbsp;for</em>. One task, two points of view, never two copies.</dd>
+    </div>
+    <div>
+      <dt>Name somebody outside</dt>
+      <dd>Somebody who is not on the folder cannot tick anything off, so it becomes a plain
+      waiting-for instead of pretending to be their task.</dd>
+    </div>
+    <div>
+      <dt>People</dt>
+      <dd>Appears once there is more than you. Shows who is carrying what, which is the half
+      that <em>Waiting&nbsp;for</em> never tells you.</dd>
+    </div>
+    <div>
+      <dt>Tick the states you want to see</dt>
+      <dd>To do, Doing and Waiting for are checkboxes, so you can read them together or one at
+      a time. A state you have never used is never mentioned.</dd>
+    </div>
+  </dl>
+  <div class="flag">
+    <span class="title">Everything in the folder is shared. That is the only rule.</span>
+    <p>There are no per-task permissions, because the folder is the permission. If something
+    should not be seen, open the page and use <strong>make private</strong> — it asks which
+    other folder to move it to, because moving it is the only thing that actually makes it
+    private.</p>
+  </div>
+</section>
+
+<section>
+  <span class="eyebrow">Advanced</span>
+  <h2>When you want more</h2>
+
+  <details>
+    <summary>Put it on your phone <span class="sub">needs a web link, about ten minutes</span></summary>
+    <div class="inner">
+      <p>A phone can run GroupToDo, but not from a file. Phones refuse to give a page opened as
+      a file anywhere to save, and they cannot open folders at all. So the phone needs a
+      <strong>web address</strong>, and it keeps its own copy that you carry back and forth as a
+      single file.</p>
+      <div class="flag">
+        <span class="title">Do not tap the app file in your cloud app</span>
+        <p>It opens, looks fine, saves nothing, and loses what you typed when you close it.
+        GroupToDo will warn you. Use the link.</p>
+      </div>
+      <ol class="steps">
+        <li><div class="body"><span class="what">Somebody puts the files on a web address</span>
+          <span class="note">Once, for everyone. Your intranet or a SharePoint-hosted site is
+          tidiest at work. A document library will <em>not</em> work — that is file storage, not
+          a web host.</span></div></li>
+        <li><div class="body"><span class="what">Open that address on the phone, then <strong>Add to phone</strong></span>
+          <span class="note">You get an icon, and after the first visit it opens with no
+          signal.</span></div></li>
+        <li><div class="body"><span class="what">On the computer: <strong>Link vault file</strong>, saved beside the folder</span>
+          <span class="note">Call it <span class="path">work-vault.md</span>. Next to the folder,
+          not inside it. The computer then keeps it up to date on its own.</span></div></li>
+        <li><div class="body"><span class="what">On the phone: <strong>Open vault file</strong> to collect, <strong>Send vault file</strong> to post back</span>
+          <span class="note">Two taps, one each way. Nothing is ever overwritten — both sides'
+          work survives.</span></div></li>
+      </ol>
+    </div>
+  </details>
+
+  <details>
+    <summary>Everything in sync, no file passing <span class="sub">one always-on machine</span></summary>
+    <div class="inner">
+      <p>If somebody has a machine that is always on, it can serve the list to everybody —
+      computers and phones, live both ways, no vault file to carry. It needs a password and ten
+      minutes of setup by whoever owns the machine. Ask them to read
+      <code>README.md</code>.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>Dates in your calendar <span class="sub">Outlook, Google, or a file</span></summary>
+    <div class="inner">
+      <p>Anything with a date gets an <strong>Add to calendar</strong> button, and
+      <strong>Planned</strong> can send the lot at once. Two ways out, and the difference is
+      worth knowing: a downloaded file is made on your own machine and goes nowhere, while
+      the Outlook and Google links open their new-event screen with the title and date
+      carried in the web address.</p>
+      <p>Nothing is ever subscribed. A live calendar feed would mean your whole list sitting
+      at a web address guarded by nothing but the fact that nobody has guessed it, so there
+      is deliberately no such thing here.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>Separate parts of your life <span class="sub">work, home, volunteering</span></summary>
+    <div class="inner">
+      <p>Each one is its own folder, called an <strong>area</strong>. Two areas can never share
+      a folder and one can never sit inside another, so the folder you share is exactly what you
+      meant to share. Colleagues who get Work cannot see Home, because it is not in there.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>If it is not behaving <span class="sub">the three things that actually go wrong</span></summary>
+    <div class="inner">
+      <dl class="habits">
+        <div>
+          <dt>Nobody was told I gave them a task</dt>
+          <dd>Correct — there is no server to send anything. They are told when they next open
+          the area, and so are you when something of yours is finished.</dd>
+        </div>
+        <div>
+          <dt>A warning that nothing can be saved</dt>
+          <dd>You opened it inside something that will not let it store anything — usually a
+          preview in a document library. Download the file and open it from your computer.</dd>
+        </div>
+        <div>
+          <dt>&ldquo;browser only &mdash; no files&rdquo; at the bottom of the sidebar</dt>
+          <dd>No folder chosen yet, so nothing is being written. Click that line, then Choose
+          folder. On a phone this is normal and expected.</dd>
+        </div>
+        <div>
+          <dt>You cannot find the files</dt>
+          <dd>Only a computer writes them, and only after you pick a folder. Look inside it:
+          <code>journals\</code> is one file per person per day,
+          <code>pages\</code> one file per project and list.</dd>
+        </div>
+      </dl>
+    </div>
+  </details>
+</section>
+
+<footer>
+  <span>Your tasks stay in your folder. The app cannot send them anywhere — it is blocked from
+  reaching the internet at all, which is also why there is nothing to log in to.</span>
+  <span>Stuck on a step? Ask whoever sent you this.</span>
+</footer>
+
+</div>
+</body>
+</html>
